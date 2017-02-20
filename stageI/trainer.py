@@ -28,6 +28,16 @@ def KL_loss(mu, log_sigma):
 class CondGANTrainer(object):
     def __init__(self,
                  model,
+                 batch_size,
+                 max_epoch,
+                 snapshot_interval,
+                 model_path,
+                 input_shape,
+                 embedding_shape,
+                 generator_lr,
+                 discriminator_lr,
+                 num_embedding,
+                 lr_decay_step,
                  dataset=None,
                  exp_name="model",
                  ckt_logs_dir="ckt_logs",
@@ -41,24 +51,37 @@ class CondGANTrainer(object):
         self.log_dir = ckt_logs_dir
         self.checkpoint_dir = ckt_logs_dir
 
-        self.batch_size = cfg.TRAIN.BATCH_SIZE
-        self.max_epoch = cfg.TRAIN.MAX_EPOCH
-        self.snapshot_interval = cfg.TRAIN.SNAPSHOT_INTERVAL
-        self.model_path = cfg.TRAIN.PRETRAINED_MODEL
+        #self.batch_size = cfg.TRAIN.BATCH_SIZE
+        #self.max_epoch = cfg.TRAIN.MAX_EPOCH
+        #self.snapshot_interval = cfg.TRAIN.SNAPSHOT_INTERVAL
+        #self.model_path = cfg.TRAIN.PRETRAINED_MODEL
+
+        self.batch_size = batch_size
+        self.max_epoch = max_epoch
+        self.snapshot_interval = snapshot_interval
+        self.model_path = model_path
+        self.input_shape = input_shape
+        self.embedding_shape = embedding_shape
+
+	    generator_lr = self.generator_lr
+	    discriminator_lr = self.discriminator_lr
+	    num_embedding = self.num_embedding
+	    lr_decay_step = self.lr_decay_step
+        
 
         self.log_vars = []
 
     def build_placeholder(self):
         '''Helper function for init_opt'''
         self.images = tf.placeholder(
-            tf.float32, [self.batch_size] + self.dataset.image_shape,
+            tf.float32, [self.batch_size] + self.input_shape,
             name='real_images')
         self.wrong_images = tf.placeholder(
-            tf.float32, [self.batch_size] + self.dataset.image_shape,
+            tf.float32, [self.batch_size] + self.input_shape,
             name='wrong_images'
         )
         self.embeddings = tf.placeholder(
-            tf.float32, [self.batch_size] + self.dataset.embedding_shape,
+            tf.float32, [self.batch_size] + self.embedding_shape,
             name='conditional_embeddings'
         )
 
@@ -299,7 +322,47 @@ class CondGANTrainer(object):
             counter = 0
         return counter
 
-    def train(self):
+    def next_batch(self, batch_size, perm,
+    			   start, end,
+    			   X_train, embeddings,
+    			   num_examples):
+        """Return the next `batch_size` examples from this data set."""
+        #start = self._index_in_epoch
+
+        current_ids = perm[start:end]
+        fake_ids = np.random.randint(num_examples, size=batch_size)
+        collision_flag =\
+            (class_id[current_ids] == class_id[fake_ids])
+        fake_ids[collision_flag] =\
+            (fake_ids[collision_flag] +
+             np.random.randint(100, 200)) % num_examples
+
+        sampled_data = X_train[current_ids]
+        sampled_wrong_data = X_train[fake_ids, :, :, :]
+        sampled_data = sampled_data.astype(np.float32)
+        sampled_wrong_data = sampled_wrong_data.astype(np.float32)
+        sampled_data = sampled_data * (2. / 255) - 1.
+        sampled_wrong_data = sampled_wrong_data * (2. / 255) - 1.
+
+        #sampled_data = self.transform(sampled_data)
+        #sampled_wrong_images = self.transform(sampled_wrong_images)
+        ret_list = [sampled_data, sampled_wrong_data]
+
+        if embeddings is not None:
+            sampled_embeddings = np.squeeze(embeddings[current_ids])
+            ret_list.append(sampled_embeddings)
+            ret_list.append(None)
+        else:
+            ret_list.append(None)
+            ret_list.append(None)
+
+        #if self._labels is not None:
+        #    ret_list.append(self._labels[current_ids])
+        #else:
+        ret_list.append(None)
+        return ret_list
+
+    def train(self, X_train, embeddings_train):
         config = tf.ConfigProto(allow_soft_placement=True)
         with tf.Session(config=config) as sess:
             with tf.device("/gpu:%d" % cfg.GPU_ID):
@@ -319,14 +382,33 @@ class CondGANTrainer(object):
                         log_vars.append(v)
                         log_keys.append(k)
                         # print(k, v)
-                generator_lr = cfg.TRAIN.GENERATOR_LR
-                discriminator_lr = cfg.TRAIN.DISCRIMINATOR_LR
-                num_embedding = cfg.TRAIN.NUM_EMBEDDING
-                lr_decay_step = cfg.TRAIN.LR_DECAY_EPOCH
-                number_example = self.dataset.train._num_examples
+                
+                generator_lr = self.generator_lr
+                discriminator_lr = self.discriminator_lr
+                num_embedding = self.num_embedding
+                lr_decay_step = self.lr_decay_step
+
+                #generator_lr = cfg.TRAIN.GENERATOR_LR
+                #discriminator_lr = cfg.TRAIN.DISCRIMINATOR_LR
+                #num_embedding = cfg.TRAIN.NUM_EMBEDDING
+                #lr_decay_step = cfg.TRAIN.LR_DECAY_EPOCH
+                
+                #number_example = self.dataset.train._num_examples
+                number_example = X_train.shape[0]
+
                 updates_per_epoch = int(number_example / self.batch_size)
                 epoch_start = int(counter / updates_per_epoch)
+                epochs_completed = -1
                 for epoch in range(epoch_start, self.max_epoch):
+		            epochs_completed += 1
+		            # Shuffle the data
+		            perm = np.arange(num_examples)
+		            np.random.shuffle(perm)
+		            start = -batch_size
+		            index_in_epoch = 0
+		            assert batch_size <= num_examples
+
+
                     widgets = ["epoch #%d|" % epoch,
                                Percentage(), Bar(), ETA()]
                     pbar = ProgressBar(maxval=updates_per_epoch,
@@ -339,11 +421,18 @@ class CondGANTrainer(object):
 
                     all_log_vals = []
                     for i in range(updates_per_epoch):
+                    	start += batch_size
+                    	index_in_epoch += batch_size
                         pbar.update(i)
                         # training d
+
+
                         images, wrong_images, embeddings, _, _ =\
-                            self.dataset.train.next_batch(self.batch_size,
-                                                          num_embedding)
+                            self.next_batch(self.batch_size, perm,
+							    			start, index_in_epoch,
+							    			X_train, embeddings_train,
+							    			num_examples)
+
                         feed_dict = {self.images: images,
                                      self.wrong_images: wrong_images,
                                      self.embeddings: embeddings,
@@ -376,8 +465,8 @@ class CondGANTrainer(object):
                             fn = saver.save(sess, snapshot_path)
                             print("Model saved in file: %s" % fn)
 
-                    img_sum = self.epoch_sum_images(sess, cfg.TRAIN.NUM_COPY)
-                    summary_writer.add_summary(img_sum, counter)
+                    #img_sum = self.epoch_sum_images(sess, cfg.TRAIN.NUM_COPY)
+                    #summary_writer.add_summary(img_sum, counter)
 
                     avg_log_vals = np.mean(np.array(all_log_vals), axis=0)
                     dic_logs = {}
